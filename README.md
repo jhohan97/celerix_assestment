@@ -28,3 +28,8 @@ Para la ejecucion de la infraestructura refierace al redme que se encuentra en l
 │           ├── 1-test/        # Backend y variables para Test
 │           └── 2-prod/        # Backend y variables para Producción
 └── readme.md                  # Documentación general
+```
+
+## Respuesta al Escenario 5 
+
+Para esta pregunta no tengo el conocimiento preciso para darle solución, pero la tomaría con una investigación, comenzando por que herramientas existen y que ofrecen, creria una POC que me permita explorar el funcionamiento, teniendo un buen resultado de la POC ya lo aplicaría a las necesidades del negocio.

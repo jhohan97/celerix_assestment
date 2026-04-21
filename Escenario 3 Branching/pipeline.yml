@@ -1,0 +1,223 @@
+name: Celerix CI/CD Pipeline
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+# ─────────────────────────────────────────────
+# STAGE 1: CI — Validaciones, Tests, Build
+# Se ejecuta en PRs y pushes a develop/main
+# ─────────────────────────────────────────────
+jobs:
+  ci:
+    name: "CI — Lint, Test & Build"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # Para OIDC con AWS (sin access keys)
+      contents: read
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # ── Lint y análisis estático ──
+      - name: Setup Node / Python (ajustar según stack)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # ── Tests unitarios e integración ──
+      - name: Tests unitarios
+        run: npm run test:unit
+
+      - name: Tests de integración
+        run: npm run test:integration
+        env:
+          # Secretos inyectados desde GitHub Secrets 
+          DB_URL: ${{ secrets.TEST_DB_URL }}
+
+      # ── Build de imagen Docker ──
+      - name: Configurar AWS credentials (OIDC — sin access keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build imagen Docker
+        id: build-image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t $ECR_REGISTRY/celerix-api:$IMAGE_TAG .
+          echo "image=$ECR_REGISTRY/celerix-api:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ── Escaneo de seguridad de la imagen ──
+      - name: Scan de vulnerabilidades (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image }}
+          format: "table"
+          exit-code: "1"          # Falla el pipeline si hay CVEs críticos
+          severity: "CRITICAL,HIGH"
+
+      # ── Push a ECR solo si CI pasa ──
+      - name: Push imagen a ECR
+        run: docker push ${{ steps.build-image.outputs.image }}
+
+      # ── Notificación de fallo en CI ──
+      - name: Notificar fallo en Slack
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "❌ *CI FALLÓ* en `${{ github.repository }}`\nRama: `${{ github.ref_name }}`\nCommit: `${{ github.sha }}`\nActor: `${{ github.actor }}`\nVer: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# ─────────────────────────────────────────────
+# STAGE 2: Deploy automático a STAGING
+# Solo cuando hay push a develop (PR mergeado)
+# ─────────────────────────────────────────────
+  deploy-staging:
+    name: "Deploy → Staging (Auto)"
+    needs: ci
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: staging   # Mapea al environment de GitHub con sus secrets
+
+    steps:
+      - name: Configurar AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Obtener secretos desde AWS Secrets Manager ──
+      - name: Obtener secretos de Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@v2
+        with:
+          secret-ids: |
+            celerix/staging/db-credentials
+            celerix/staging/api-keys
+          parse-json-secrets: true
+
+      # ── Actualizar Task Definition con nueva imagen ──
+      - name: Descargar task definition actual
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition celerix-api-staging \
+            --query taskDefinition > task-def.json
+
+      - name: Actualizar imagen en task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: celerix-api
+          image: ${{ env.ECR_REGISTRY }}/celerix-api:${{ github.sha }}
+
+      # ── Blue/Green deploy en ECS via CodeDeploy ──
+      - name: Deploy a ECS Staging (Blue/Green)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: celerix-api-staging
+          cluster: celerix-staging
+          wait-for-service-stability: true
+          codedeploy-appspec: appspec-staging.json
+          codedeploy-application: celerix-staging
+          codedeploy-deployment-group: celerix-api-staging-dg
+
+      # ── Smoke tests post-deploy ──
+      - name: Smoke tests en Staging
+        run: |
+          curl -f https://staging.celerix.io/health || exit 1
+          echo "✅ Staging saludable"
+
+      - name: Notificar deploy exitoso en Slack
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ *Staging actualizado*\nCommit: `${{ github.sha }}`\nActor: `${{ github.actor }}`\nhttps://staging.celerix.io"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# ─────────────────────────────────────────────
+# STAGE 3: Deploy a PRODUCCIÓN con aprobación
+# Solo cuando hay push a main
+# ─────────────────────────────────────────────
+  deploy-production:
+    name: "Deploy → Production (Manual Approval)"
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production   # Este environment tiene "Required reviewers" en GitHub
+
+    steps:
+      - name: Configurar AWS credentials (Producción)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Descargar task definition de producción
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition celerix-api-prod \
+            --query taskDefinition > task-def-prod.json
+
+      - name: Actualizar imagen en task definition
+        id: task-def-prod
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def-prod.json
+          container-name: celerix-api
+          image: ${{ env.ECR_REGISTRY }}/celerix-api:${{ github.sha }}
+
+      - name: Deploy a ECS Producción (Blue/Green)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-prod.outputs.task-definition }}
+          service: celerix-api-prod
+          cluster: celerix-prod
+          wait-for-service-stability: true
+          codedeploy-appspec: appspec-prod.json
+          codedeploy-application: celerix-prod
+          codedeploy-deployment-group: celerix-api-prod-dg
+
+      # ── Tag de versión en Git ──
+      - name: Crear tag de release
+        run: |
+          git tag v$(date +'%Y.%m.%d')-${{ github.run_number }}
+          git push origin --tags
+
+      - name: Notificar deploy a producción
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '🚀' || '🔥' }} *Deploy PROD ${{ job.status }}*\nCommit: `${{ github.sha }}`\nAprobado por: `${{ github.actor }}`"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
